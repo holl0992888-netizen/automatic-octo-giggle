@@ -117,3 +117,4 @@ if __name__ == "__main__":
         asyncio.run(start_application())
     except (KeyboardInterrupt, SystemExit):
         logging.info("🛑 Роботу контент-бота зупинено.")
+
