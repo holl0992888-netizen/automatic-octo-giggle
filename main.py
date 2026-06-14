@@ -18,7 +18,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from google import genai
 from google.genai import types
 
-# Налаштування логування для Railway (вивід у stdout/stderr)
+# Налаштування логування для Railway
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -34,29 +34,34 @@ CHANNEL_ID = os.getenv("CHANNEL_ID")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 AFFILIATE_PID = os.getenv("AFFILIATE_PID")
 
-# RSS стрічка гарячих товарів AliExpress
 ALIEXPRESS_RSS_URL = "https://aliexpress.com" 
 
-# Валідація критичних налаштувань під час старту
 if not all([BOT_TOKEN, CHANNEL_ID, GEMINI_API_KEY, AFFILIATE_PID]):
-    logger.critical("❌ Відсутні необхідні змінні оточення! Перевірте .env або налаштування Railway.")
+    logger.critical("❌ Відсутні необхідні змінні оточення!")
     exit(1)
 
-# Ініціалізація клієнтів
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 ai_client = genai.Client(api_key=GEMINI_API_KEY)
 scheduler = AsyncIOScheduler()
 
+def clean_url(url: str) -> str:
+    """Безпечно очищає лінк від GET-параметрів"""
+    if not url:
+        return ""
+    return url.split('?')[0].strip()
+
 async def check_is_duplicate(target_url: str) -> bool:
     """
     Асинхронно перевіряє останні 50 повідомлень у каналі.
-    Шукає збіги за текстом або за URL інлайн-кнопок, щоб виключити дублікати.
+    Якщо виникає помилка доступу, повертає False, щоб не блокувати роботу.
     """
     try:
         logger.info(f"Перевірка лінка на дублікати в каналі {CHANNEL_ID}...")
-        # Очищаємо вхідне посилання для точного зіставлення ID товару
-        cleaned_target = target_url.split('?')[0].strip()
+        cleaned_target = clean_url(target_url)
+        
+        if not cleaned_target:
+            return False
         
         history = await bot.get_chat_history(chat_id=CHANNEL_ID, limit=50)
         for message in history:
@@ -73,20 +78,18 @@ async def check_is_duplicate(target_url: str) -> bool:
                         if button.url and cleaned_target in button.url:
                             return True
     except Exception as e:
-        logger.error(f"⚠️ Помилка під час перевірки історії каналу (get_chat_history): {e}")
-        # У разі збою API вважаємо, що дублікат є, заради безпеки контенту
-        return True
+        logger.warning(f"⚠️ Помилка читання історії каналу (можливо, канал порожній або бот не адмін): {e}")
+        # Якщо сталася помилка доступу, дозволяємо публікацію (повертаємо False)
+        return False
     return False
 
 async def generate_marketing_post(product_title: str) -> str:
-    """
-    Генерація рекламного тексту через Gemini 2.5 Flash виключно українською мовою.
-    """
+    """Генерація рекламного тексту через Gemini 2.5 Flash виключно українською мовою"""
     prompt = f"""
     Ти — професійний копірайтер. Напиши короткий, агресивний, маркетинговий пост для Telegram-каналу на основі назви товару: "{product_title}".
     
     СУВОРІ ПРАВИЛА:
-    1. Текс має бути написаний виключно чистою українською мовою. Ніяких русизмів, кальок чи суржику (забудь слова "заказ", "скидка", "доставка безкоштовна" замість "безкоштовна доставка").
+    1. Текст має бути написаний виключно чистою українською мовою. Ніяких русизмів, кальок чи суржику (забудь слова "заказ", "скидка", "доставка безкоштовна" замість "безкоштовна доставка").
     2. Додай яскраві емодзі, що привертають увагу та чіпляють погляд.
     3. Штучно та реалістично підкресли велику знижку (наприклад, -50% або -70%).
     4. Обов'язково виділи цінові блоки жирним шрифтом (Markdown), використовуючи вигадану, але реалістичну ціну в гривнях (наприклад, **🔥 Стара ціна: 1200 грн | Нова ціна: 599 грн**).
@@ -103,14 +106,11 @@ async def generate_marketing_post(product_title: str) -> str:
     except Exception as e:
         logger.error(f"⚠️ Помилка інтеграції з Gemini API: {e}")
     
-    # Резервний шаблон на випадок збою AI
     return f"🔥 **ШОК-ЦІНА на AliExpress!** 🔥\n\n🛍 {product_title}\n\n📉 **Знижка -50% просто зараз!**\n\nПоспішай забрати крутий девайс за найкращою ціною в Україні! Кількість обмежена!"
 
 async def fetch_and_post_deal():
-    """
-    Основна бізнес-логіка: парсинг RSS, фільтрація дублів, AI-генерація та публікація в канал.
-    """
-    logger.info("Запуск процесу парсингу свіжих пропозицій...")
+    """Основна бізнес-логіка: парсинг RSS, фільтрація дублів, AI-генерація та публікація"""
+    logger.info("📡 Запуск процесу парсингу свіжих пропозицій...")
     async with aiohttp.ClientSession() as session:
         try:
             async with session.get(ALIEXPRESS_RSS_URL, timeout=15) as response:
@@ -122,7 +122,6 @@ async def fetch_and_post_deal():
             logger.error(f"❌ Помилка мережі під час запиту до RSS: {e}")
             return
 
-    # Парсимо XML структуру RSS-фіду
     feed = feedparser.parse(xml_data)
     if not feed.entries:
         logger.warning("RSS стрічка виявилася порожньою.")
@@ -134,7 +133,6 @@ async def fetch_and_post_deal():
             title = entry.title
             description = entry.get("description", "")
 
-            # Вилучаємо точний URL зображення (img src) з опису товару
             img_src = None
             if description:
                 soup = BeautifulSoup(description, "html.parser")
@@ -146,25 +144,21 @@ async def fetch_and_post_deal():
                 logger.info(f"Пропуск товару '{title}': відсутнє валідне зображення.")
                 continue
 
-            # Перевірка на дублікат у Telegram-каналі
+            # Перевірка на дублікат
             if await check_is_duplicate(original_url):
                 logger.info(f"Пропуск товару (вже публікувався): {title}")
                 continue
 
-            # Формування партнерського посилання (Admitad wrapper формат)
-            cleaned_url = original_url.split('?')[0].strip()
-            affiliate_url = f"https://aliexpress.com_{AFFILIATE_PID}?target={cleaned_url}"
+            cleaned_url_str = clean_url(original_url)
+            affiliate_url = f"https://aliexpress.com_{AFFILIATE_PID}?target={cleaned_url_str}"
 
-            # Генерація контенту за допомогою штучного інтелекту
+            logger.info(f"Надсилання запиту до Gemini для товару: {title}")
             post_text = await generate_marketing_post(title)
 
-            # Створення інлайн-клавіатури з кнопкою переходу
             keyboard = InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(text="🛒 КУПИТИ ЗІ ЗНИЖКОЮ", url=affiliate_url)]
             ])
 
-            # Публікація в канал (фото + опис + кнопка)
-            # Окремий блок try/except гарантує, що бите посилання на картинку не зламає цикл
             try:
                 await bot.send_photo(
                     chat_id=CHANNEL_ID,
@@ -174,23 +168,26 @@ async def fetch_and_post_deal():
                     reply_markup=keyboard
                 )
                 logger.info(f"✅ Успішно опубліковано новий пост: {title}")
-                break # Виходимо з циклу стрічки одразу після першого успішного унікального поста
+                break 
             except Exception as photo_err:
-                logger.error(f"⚠️ Помилка відправки фото ({img_src}) для товару '{title}': {photo_err}")
-                continue # Якщо картинка невалідна, пробуємо наступний офер із фіду
+                logger.error(f"⚠️ Помилка відправки фото у Telegram ({img_src}): {photo_err}")
+                continue 
 
         except Exception as item_err:
             logger.error(f"⚠️ Помилка обробки елемента фіду: {item_err}")
             continue
 
 async def main():
-    logger.info("🚀 Запуск автономного Telegram Content Bot...")
+    logger.info("🚀 Повна ініціалізація автономного Telegram Content Bot...")
     
-    # 1. Миттєвий тест-тригер при старті сервера для перевірки працездатності
+    # 1. Миттєвий тест-тригер при старті
     logger.info("⚡ Виконання моментального стартового тесту (1-й пост)...")
-    await fetch_and_post_deal()
+    try:
+        await fetch_and_post_deal()
+    except Exception as start_err:
+        logger.error(f"⚠️ Критична помилка стартового таску: {start_err}")
 
-    # 2. Планування 2-го поста рівно через 5 хвилин після старту
+    # 2. Планування 2-го поста на +5 хвилин
     scheduler.add_job(
         fetch_and_post_deal,
         'date',
@@ -199,7 +196,7 @@ async def main():
     )
     logger.info("📅 Друга публікація успішно запланована на +5 хвилин від поточного часу.")
 
-    # 3. Планирування всіх наступних постів строго кожні 2 години (7200 секунд)
+    # 3. Регулярний цикл кожні 2 години
     scheduler.add_job(
         fetch_and_post_deal,
         'interval',
@@ -208,10 +205,8 @@ async def main():
     )
     logger.info("📅 Регулярний інтервальний цикл (кожні 2 години) активовано.")
 
-    # Старт планувальника задач
     scheduler.start()
 
-    # Утримання процесу активним (24/7 worker сесія на Railway)
     try:
         await dp.start_polling(bot)
     finally:
